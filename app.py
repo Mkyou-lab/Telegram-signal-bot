@@ -2,47 +2,52 @@ import os
 import logging
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+# Logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN is required")
+    raise RuntimeError("BOT_TOKEN not set!")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# FastAPI app
 app = FastAPI()
-scheduler = AsyncIOScheduler()
+
+# Telegram app
+tg_app = Application.builder().token(BOT_TOKEN).build()
+
 subscribers = set()
 
-# --- Telegram handlers ---
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer("Welcome! Use /subscribe to get signals.")
+# Commands
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome! Use /subscribe to receive signals.")
 
-@dp.message(Command("subscribe"))
-async def subscribe_cmd(message: types.Message):
-    subscribers.add(message.chat.id)
-    await message.answer("You are now subscribed to signals ✅")
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribers.add(update.message.chat_id)
+    await update.message.reply_text("✅ You are now subscribed to signals.")
 
-@dp.message(Command("unsubscribe"))
-async def unsubscribe_cmd(message: types.Message):
-    subscribers.discard(message.chat.id)
-    await message.answer("You are now unsubscribed ❌")
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribers.discard(update.message.chat_id)
+    await update.message.reply_text("❌ You unsubscribed from signals.")
 
-# --- FastAPI webhook ---
+tg_app.add_handler(CommandHandler("start", start))
+tg_app.add_handler(CommandHandler("subscribe", subscribe))
+tg_app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+
+# API endpoint for external signals
 @app.post("/signal")
-async def signal_endpoint(request: Request):
+async def send_signal(request: Request):
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Secret")
         if secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="Invalid secret")
+            raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
     pair = data.get("pair")
@@ -50,24 +55,26 @@ async def signal_endpoint(request: Request):
     expiry = data.get("expiry_minutes")
     note = data.get("note", "")
 
-    if not pair or not direction or not expiry:
-        raise HTTPException(status_code=400, detail="Missing fields")
+    message = f"📊 Signal Alert\nPair: {pair}\nDirection: {direction}\nExpiry: {expiry}m\nNote: {note}"
 
-    text = f"📊 Signal\nPair: {pair}\nDirection: {direction}\nExpiry: {expiry}m\nNote: {note}"
     for chat_id in subscribers:
         try:
-            await bot.send_message(chat_id, text)
+            await tg_app.bot.send_message(chat_id=chat_id, text=message)
         except Exception as e:
-            logging.error(f"Failed to send to {chat_id}: {e}")
+            logger.error(f"Failed to send message: {e}")
 
-    return {"status": "ok"}
+    return {"status": "ok", "sent_to": len(subscribers)}
 
-# --- Startup ---
-@app.on_event("startup")
-async def on_startup():
-    scheduler.start()
-    import asyncio
-    asyncio.create_task(dp.start_polling(bot))
-
+# Run
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    import asyncio
+
+    async def run():
+        await tg_app.initialize()
+        await tg_app.start()
+        config = uvicorn.Config(app, host="0.0.0.0", port=8000)
+        server = uvicorn.Server(config)
+        await server.serve()
+        await tg_app.stop()
+
+    asyncio.run(run())
